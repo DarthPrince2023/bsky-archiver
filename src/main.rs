@@ -127,145 +127,207 @@ impl PostInformation {
                 let url = self.url.clone();
                 let username = self.username.clone();
                 let password = self.password.clone();
+                let posts_dir_exists = fs::exists("./posts")
+                    .map_err(|error| Errors::FileCreateError(error))?;
 
                 tokio::spawn(async move {
-                    let _ = archive(url, username, password).await;
+                    let post_id = match Regex::new(r"profile/([a-zA-Z0-9._-]+)/post/([A-Za-z0-9._:~-]+)")
+                        .map_err(|error| Errors::RegexError(error)) {
+                            Ok(post_id) => post_id,
+                            Err(error) => {
+                                panic!("Unable to extract post ID from URL provided => {error}");
+                            }
+                        };
+                    let captures = &post_id.captures(&url);
+                    let post_info_pieces = match captures {
+                        Some(captures) => captures,
+                        None => exit(69)
+                    };
+                    let mut headers = HeaderMap::new();
+                        headers.insert("User-Agent", HeaderValue::from_static("Mozilla/5.0"));
+                        headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+                    let client = match ClientBuilder::new()
+                        .redirect(Policy::limited(100))
+                        .default_headers(headers)
+                        .build() {
+                            Ok(client) => client,
+                            Err(error) =>
+                                panic!("Unable to build client => {error}")
+                        };
+                    let url = format!("https://web.archive.org/save/{}", &url);
+
+                    // Here we will login to Bluesky, get a JWT token, then get the post
+                    let auth_response = match client
+                        .post("https://bsky.social/xrpc/com.atproto.server.createSession")
+                        .body(json!({
+                            "identifier": username,
+                            "password": password
+                        })
+                        .to_string())
+                        .send()
+                        .await
+                        .map_err(|error| Errors::ReqwestSendError(error)) {
+                            Ok(response) => response,
+                            Err(error) =>
+                                panic!("Failed to send request to service => {error}"),
+                        };
+                    let response_bytes = match auth_response
+                        .bytes()
+                        .await {
+                            Ok(response_bytes) => response_bytes,
+                            Err(error) =>
+                                panic!("Failed to get bytes from response => {error}"),
+                        }
+                        .to_vec();
+                    let creds = match serde_json::from_slice::<BskyCreds>(&response_bytes) {
+                        Ok(creds) => creds,
+                        Err(error) =>
+                            panic!("Failed to deserialize received bytes => {error}")
+                    };
+                    let response = match client
+                        .get(format!("https://bsky.social/xrpc/com.atproto.identity.resolveHandle?handle={}", &post_info_pieces[1]))
+                        .send()
+                        .await {
+                            Ok(response) => response,
+                            Err(error) =>
+                                panic!("Failed to send request to host => {error}")
+                        };
+                    let bytes = match response
+                        .bytes()
+                        .await {
+                            Ok(bytes) => bytes,
+                            Err(error) =>
+                                panic!("Failed to get bytes from response => {error}")
+                        }
+                        .to_vec();
+                    let did = match serde_json::from_slice::<Did>(&bytes) {
+                        Ok(did) => did,
+                        Err(error) =>
+                            panic!("Failed to deserialize received bytes => {error}")
+                    };
+                    let response = match client
+                        .get(format!("https://bsky.social/xrpc/app.bsky.feed.getPostThread?uri=at://{}/app.bsky.feed.post/{}", did.did, &post_info_pieces[2]))
+                        .bearer_auth(creds.access_jwt)
+                        .send()
+                        .await {
+                            Ok(response) => response,
+                            Err(error) =>
+                                panic!("Failed to send request to host => {error}")
+                        };
+                    let response_bytes = match response
+                        .bytes() 
+                        .await {
+                            Ok(bytes) => bytes,
+                            Err(error) =>
+                                panic!("Could not get bytes from response => {error}")
+                        }
+                        .to_vec();
+                    let post_data = match serde_json::from_slice::<ThreadData>(&response_bytes) {
+                        Ok(post_data) => post_data,
+                        Err(error) =>
+                            panic!("Failed to deserialize received bytes => {error}")
+                    };
+                    if let Some(post) = post_data
+                        .thread
+                        .post {
+                        if let Some(record) = post
+                            .record {
+                            println!("Saving post locally...");
+
+                            // Write the post content to a file to preserve its contents locally
+                            if !posts_dir_exists {
+                                let _ = fs::create_dir("./posts");
+                            }
+                            let _ = fs::create_dir(format!("./posts/{}", &post_info_pieces[2]));
+                            let filename = &format!("./posts/{}/raw.json", &post_info_pieces[2]);
+                            let mut file = match File::create_new(filename) {
+                                Ok(file) => file,
+                                Err(error) =>
+                                    panic!("Could not create archive file => {error}")
+                            };
+                            let _ = file.write(&response_bytes);
+                            println!("Raw post data archived...Saving associated media...");
+                            if let Some(media) = record
+                                .embed {
+                                for image in media.images {
+                                    let image = match &image.image {
+                                        Some(image) => image,
+                                        None => break,  
+                                    };
+                                    let referer = match &image.referer {
+                                        Some(referer) => referer,
+                                        None => break,
+                                    };
+                                    let url = format!("https://bsky.social/xrpc/com.atproto.sync.getBlob?did={}&cid={}", &did.did, &referer.resource_cid);
+                                    let response = match client
+                                        .get(&url)
+                                        .send()
+                                        .await {
+                                            Ok(response) => response,
+                                            Err(error) =>
+                                                panic!("Failed to send request to host => {error}")
+                                        };
+                                    let blob = match response
+                                        .bytes()
+                                        .await {
+                                            Ok(bytes) => bytes,
+                                            Err(error) =>
+                                                panic!("Failed to get bytes from response => {error}")
+                                        }
+                                        .to_vec();
+                                    let mut image_file = match File::create(format!("./posts/{}/{}.png", &post_info_pieces[2], &referer.resource_cid)) {
+                                        Ok(file) => file,
+                                        Err(error) =>
+                                            panic!("Unable to create image file => {error}")
+                                    };
+                                    let _ = image_file.write(&blob);
+                                    println!("Saved {}", &referer.resource_cid)
+                                }
+
+                                if let Some(video) = media.video {
+                                    println!("Saving video from post");
+                                    let referer = match video.referer {
+                                        Some(referer) => referer,
+                                        None => exit(71)
+                                    };
+                                    let url = format!("https://bsky.social/xrpc/com.atproto.sync.getBlob?did={}&cid={}", &did.did, &referer.resource_cid);
+                                    let response = match client
+                                        .get(&url)
+                                        .send()
+                                        .await {
+                                            Ok(response) => response,
+                                            Err(error) =>
+                                                panic!("Failed to send request to host => {error}")
+                                        };
+                                    let blob = match response
+                                        .bytes()
+                                        .await {
+                                        Ok(bytes) => bytes,
+                                        Err(error) => panic!("Unable to get response bytes => {error}")
+                                    }.to_vec();
+                                    let mut video_file = match File::create(format!("./posts/{}/{}.mp4", &post_info_pieces[2], &referer.resource_cid)) {
+                                        Ok(file) => file,
+                                        Err(error) =>
+                                            panic!("Failed to create video file => {error}")
+                                    };
+                                    let _ = video_file.write(&blob);
+                                }
+                            }
+                        }
+                    }
+                    println!("Archiving externally...");
+                
+                    let _ = client
+                        .get(url)
+                        .send()
+                        .await;              
+              
+                    println!("Post archived successfully.");
+    
                 });
             }
             Ok(())
     }
-}
-
-pub async fn archive(url: String, username: String, password: String) -> Result<(), Errors> {
-    let post_id = Regex::new(r"profile/([a-zA-Z0-9._-]+)/post/([A-Za-z0-9._:~-]+)")
-        .map_err(|error| Errors::RegexError(error))?;
-    let captures = &post_id.captures(&url);
-    let post_info_pieces = match captures {
-        Some(captures) => captures,
-        None => exit(69)
-    };
-    let mut headers = HeaderMap::new();
-        headers.insert("User-Agent", HeaderValue::from_static("Mozilla/5.0"));
-        headers.insert("Content-Type", HeaderValue::from_static("application/json"));
-    let client = ClientBuilder::new()
-        .redirect(Policy::limited(100))
-        .default_headers(headers)
-        .build()
-        .map_err(|error| Errors::ReqwestSendError(error))?;
-    let url = format!("https://web.archive.org/save/{}", &url);
-
-    // Here we will login to Bluesky, get a JWT token, then get the post
-    let auth_request = client
-        .post("https://bsky.social/xrpc/com.atproto.server.createSession")
-        .body(json!({
-            "identifier": username,
-            "password": password
-        })
-        .to_string())
-        .send()
-        .await
-        .map_err(|error| Errors::ReqwestSendError(error))?
-        .bytes()
-        .await
-        .map_err(|error| Errors::ReqwestBytesError(error))?
-        .to_vec();
-    let creds = serde_json::from_slice::<BskyCreds>(&auth_request).map_err(|error| Errors::DeserializeError(error))?;
-    let request = client
-        .get(format!("https://bsky.social/xrpc/com.atproto.identity.resolveHandle?handle={}", &post_info_pieces[1]))
-        .send()
-        .await
-        .map_err(|error| Errors::ReqwestSendError(error))?
-        .bytes()
-        .await
-        .map_err(|error| Errors::ReqwestBytesError(error))?
-        .to_vec();
-    let did = serde_json::from_slice::<Did>(&request)
-        .map_err(|error| Errors::DeserializeError(error))?;
-    let post_bytes = client
-        .get(format!("https://bsky.social/xrpc/app.bsky.feed.getPostThread?uri=at://{}/app.bsky.feed.post/{}", did.did, &post_info_pieces[2]))
-        .bearer_auth(creds.access_jwt)
-        .send()
-        .await
-        .map_err(|error| Errors::ReqwestSendError(error))?
-        .bytes()
-        .await
-        .map_err(|error| Errors::ReqwestBytesError(error))?
-        .to_vec();
-    let post_data = serde_json::from_slice::<ThreadData>(&post_bytes)
-        .map_err(|error| Errors::DeserializeError(error))?;
-    if let Some(post) = post_data
-        .thread
-        .post {
-        if let Some(record) = post
-            .record {
-            // Write the post content to a file to preserve its contents locally
-            let _ = fs::create_dir(format!("./posts/{}", &post_info_pieces[2]));
-            let mut file = File::create(&format!("./posts/{}/raw.json", &post_info_pieces[2]))
-                .map_err(|error| Errors::FileCreateError(error))?;
-            let _ = file.write(&post_bytes);
-            println!("Raw post data archived...Saving associated media...");
-            if let Some(media) = record
-                .embed {
-                for image in media.images {
-                    let image = match &image.image {
-                        Some(image) => image,
-                        None => break,  
-                    };
-                    let referer = match &image.referer {
-                        Some(referer) => referer,
-                        None => break,
-                    };
-                    let url = format!("https://bsky.social/xrpc/com.atproto.sync.getBlob?did={}&cid={}", &did.did, &referer.resource_cid);
-                    let blob = client
-                        .get(&url)
-                        .send()
-                        .await
-                        .map_err(|error| Errors::ReqwestSendError(error))?
-                        .bytes()
-                        .await
-                        .map_err(|error| Errors::ReqwestBytesError(error))?
-                        .to_vec();
-                    let mut image_file = File::create(format!("./posts/{}/{}.png", &post_info_pieces[2], &referer.resource_cid))
-                        .map_err(|error| Errors::FileCreateError(error))?;
-                    let _ = image_file.write(&blob);
-                    println!("Saved {}", &referer.resource_cid)
-                }
-
-                if let Some(video) = media.video {
-                    println!("Saving video from post");
-                    let referer = match video.referer {
-                        Some(referer) => referer,
-                        None => exit(71)
-                    };
-                    let url = format!("https://bsky.social/xrpc/com.atproto.sync.getBlob?did={}&cid={}", &did.did, &referer.resource_cid);
-                    let blob = client
-                        .get(&url)
-                        .send()
-                        .await
-                        .map_err(|error| Errors::ReqwestSendError(error))?;
-                    let blob = match blob
-                        .bytes()
-                        .await {
-                        Ok(bytes) => bytes,
-                        Err(_) => panic!("Unable to get response bytes")
-                    }.to_vec();
-                    let mut image_file = File::create(format!("./posts/{}/{}.mp4", &post_info_pieces[2], &referer.resource_cid))
-                        .map_err(|error| Errors::FileCreateError(error))?;
-                    let _ = image_file.write(&blob);
-                }
-            }
-        }
-    }
-    println!("Archiving externally...");
-              
-    let _ = client
-        .get(url)
-        .send()
-        .await;              
-              
-    println!("Post archived successfully.");
-    
-    Ok(())
 }
 
 #[derive(Debug, Deserialize, Serialize)]
