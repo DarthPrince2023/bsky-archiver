@@ -9,8 +9,8 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, ToStrError}, redirect::Policy, ClientBuilder, Error as ReqwestError
 };
 use serde_json::{Error as SerdeError, json};
-use std::{env::VarError, fmt::Display, fs::{self, OpenOptions}, io::{Error as IoError, Read, Write}, net::TcpStream, num::ParseIntError, os::windows::fs::FileExt, process::exit};
-use tokio::{fs::File, io::{AsyncReadExt, AsyncWriteExt, BufWriter}};
+use std::{env::VarError, fmt::Display, io::Error as IoError, net::TcpStream, num::ParseIntError, process::exit};
+use tokio::{fs::File, io::AsyncWriteExt};
 use native_tls::{Error as NativeTlsError, HandshakeError};
 
 use crate::lib::post::Post;
@@ -203,16 +203,15 @@ pub async fn archive(post_info: Post) -> Result<(), Errors> {
 
             // Write the post content to a file to preserve its contents locally
             if !&post_info.posts_dir_exists {
-                fs::create_dir("./posts")?;
+                std::fs::create_dir("./posts")?;
             }
-            fs::create_dir(format!("./posts/{}", &post_info_pieces[2]))?;
+            std::fs::create_dir(format!("./posts/{}", &post_info_pieces[2]))?;
 
             let filename = &format!("./posts/{}/raw.json", &post_info_pieces[2]);
             let mut file = File::create_new(filename).await?;
 
             file.write_all(&response).await?;
             println!("Raw post data archived...Saving associated media...");
-            let mut line_counter = 0;
 
             if let Some(media) = record.embed {
                 for image in media.images {
