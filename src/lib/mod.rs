@@ -266,7 +266,7 @@ pub async fn archive(post_info: Post) -> Result<(), Errors> {
         }
     }
     println!("Archiving externally...");
-    // client.get(url).send().await?;
+    client.get(url).send().await?;
     println!("Post archived successfully.");
 
     Ok(())
