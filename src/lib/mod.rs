@@ -3,17 +3,50 @@ pub mod post_information;
 
 use bsky_parser::{BskyCreds, Did, ThreadData};
 use dotenvy::Error as DotEnvError;
+use image::EncodableLayout;
 use regex::Error as RegexError;
 use reqwest::{
-    ClientBuilder, Error as ReqwestError,
-    header::{HeaderMap, HeaderValue},
-    redirect::Policy,
+    header::{HeaderMap, HeaderValue, ToStrError}, redirect::Policy, ClientBuilder, Error as ReqwestError
 };
 use serde_json::{Error as SerdeError, json};
-use std::{env::VarError, fmt::Display, fs, io::Error as IoError, process::exit};
-use tokio::{fs::File, io::AsyncWriteExt};
+use std::{env::VarError, fmt::Display, fs::{self, OpenOptions}, io::{Error as IoError, Read, Write}, net::TcpStream, num::ParseIntError, os::windows::fs::FileExt, process::exit};
+use tokio::{fs::File, io::{AsyncReadExt, AsyncWriteExt, BufWriter}};
+use native_tls::{Error as NativeTlsError, HandshakeError};
 
 use crate::lib::post::Post;
+
+#[derive(Debug)]
+pub enum MediaType {
+    Mp4,
+    Mov,
+    Webm,
+    Mpeg,
+    Invalid,
+}
+
+impl<'a> From<&'a str> for MediaType {
+    fn from(value: &'a str) -> Self {
+        match value {
+            "video/mp4" => Self::Mp4,
+            "video/mov" => Self::Mov,
+            "video/webm" => Self::Webm,
+            "video/mpeg" => Self::Mpeg,
+            _ => Self::Invalid
+        }
+    }
+}
+
+impl<'a> Into<&'a str> for MediaType {
+    fn into(self) -> &'a str {
+        match self {
+            Self::Mp4 => "mp4",
+            Self::Mov => "mov",
+            Self::Webm => "webm",
+            Self::Mpeg => "mpeg",
+            Self::Invalid => "Invalid media type"
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum Errors {
@@ -23,6 +56,10 @@ pub enum Errors {
     Regex(RegexError),
     EnvVar(VarError),
     Io(IoError),
+    NativeTls(NativeTlsError),
+    Handshake(HandshakeError<TcpStream>),
+    ToStr(ToStrError),
+    ParseInt(ParseIntError),
 }
 
 impl From<ReqwestError> for Errors {
@@ -61,6 +98,30 @@ impl From<IoError> for Errors {
     }
 }
 
+impl From<NativeTlsError> for Errors {
+    fn from(value: NativeTlsError) -> Self {
+        Self::NativeTls(value)
+    }
+}
+
+impl From<HandshakeError<TcpStream>> for Errors {
+    fn from(value: HandshakeError<TcpStream>) -> Self {
+        Self::Handshake(value)
+    }
+}
+
+impl From<ToStrError> for Errors {
+    fn from(value: ToStrError) -> Self {
+        Self::ToStr(value)
+    }
+}
+
+impl From<ParseIntError> for Errors {
+    fn from(value: ParseIntError) -> Self {
+        Self::ParseInt(value)
+    }
+}
+
 impl Display for Errors {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -70,6 +131,10 @@ impl Display for Errors {
             Self::Regex(error) => write!(f, "Unable to build regular expression => {error}"),
             Self::EnvVar(error) => write!(f, "Could not load environment variable => {error}"),
             Self::Io(error) => write!(f, "Unable to create file due to error => {error}"),
+            Self::NativeTls(error) => write!(f, "TLS error => {error}"),
+            Self::Handshake(error) => write!(f, "Unable to successfully complete TCP handshake => {error}"),
+            Self::ToStr(error) => write!(f, "Unable to convert to str => {error}"),
+            Self::ParseInt(error) => write!(f, "Could not parse integer => {error}"),
         }
     }
 }
@@ -125,7 +190,7 @@ pub async fn archive(post_info: Post) -> Result<(), Errors> {
             "https://bsky.social/xrpc/app.bsky.feed.getPostThread?uri=at://{}/app.bsky.feed.post/{}",
             did.did, &post_info_pieces[2]
         ))
-        .bearer_auth(creds.access_jwt)
+        .bearer_auth(&creds.access_jwt)
         .send()
         .await?
         .bytes()
@@ -144,8 +209,11 @@ pub async fn archive(post_info: Post) -> Result<(), Errors> {
 
             let filename = &format!("./posts/{}/raw.json", &post_info_pieces[2]);
             let mut file = File::create_new(filename).await?;
+
             file.write_all(&response).await?;
             println!("Raw post data archived...Saving associated media...");
+            let mut line_counter = 0;
+
             if let Some(media) = record.embed {
                 for image in media.images {
                     let referer = &image.image.referer;
@@ -165,24 +233,40 @@ pub async fn archive(post_info: Post) -> Result<(), Errors> {
                 if let Some(video) = media.video {
                     println!("Saving video from post");
 
+                    // Exit code 101 is for no media type being provided in the response
+                    let media_type = video.mime_type.as_str();
+                    println!("MEDIA TYPE => {media_type}");
+                    let media_type: MediaType = MediaType::from(media_type);
+                    let media_type: &'static str = media_type.into();
                     let referer = video.referer;
-                    let url = format!(
-                        "https://bsky.social/xrpc/com.atproto.sync.getBlob?did={}&cid={}",
+                    let url_path = format!(
+                        "/xrpc/com.atproto.sync.getBlob?did={}&cid={}",
                         &did.did, &referer.cid
                     );
-                    let response = client.get(&url).send().await?.bytes().await?.to_vec();
+
+                    // Get the response headers for the redirect location to get the blob data
+                    let reqwest_response = client
+                        .get(format!("https://bsky.social{url_path}"))
+                        .bearer_auth(&creds.access_jwt)
+                        .send()
+                        .await?;
+                    let reqwest_response = reqwest_response
+                        .bytes()
+                        .await?;
+                    let reqwest_response = reqwest_response
+                        .as_bytes();
                     let mut video_file = File::create(format!(
-                        "./posts/{}/{}.mp4",
-                        &post_info_pieces[2], &referer.cid
-                    ))
-                    .await?;
-                    video_file.write(&response).await?;
+                            "./posts/{}/{}.{}",
+                        &post_info_pieces[2], &referer.cid, media_type
+	                )).await?;
+
+                    video_file.write_all(reqwest_response).await?;
                 }
             }
         }
     }
     println!("Archiving externally...");
-    client.get(url).send().await?;
+    // client.get(url).send().await?;
     println!("Post archived successfully.");
 
     Ok(())
