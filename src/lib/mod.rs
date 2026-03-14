@@ -1,200 +1,45 @@
+pub mod errors;
 pub mod post;
 pub mod post_information;
+pub mod types;
+pub mod extension;
 
-use bsky_parser::{BskyCreds, Did, ThreadData};
-use dotenvy::Error as DotEnvError;
-use image::EncodableLayout;
-use regex::Error as RegexError;
-use reqwest::{
-    header::{HeaderMap, HeaderValue, ToStrError}, redirect::Policy, ClientBuilder, Error as ReqwestError
-};
-use serde_json::{Error as SerdeError, json};
-use std::{env::VarError, fmt::Display, io::Error as IoError, net::TcpStream, num::ParseIntError, process::exit};
+use reqwest::{redirect::Policy, ClientBuilder as ReqwestClientBuilder};
+use serde_json::json;
+use std::fs::create_dir;
 use tokio::{fs::File, io::AsyncWriteExt};
-use native_tls::{Error as NativeTlsError, HandshakeError};
 
-use crate::lib::post::Post;
-
-#[derive(Debug)]
-pub enum MediaType {
-    Mp4,
-    Mov,
-    Webm,
-    Mpeg,
-    Invalid,
-}
-
-impl<'a> From<&'a str> for MediaType {
-    fn from(value: &'a str) -> Self {
-        match value {
-            "video/mp4" => Self::Mp4,
-            "video/mov" => Self::Mov,
-            "video/webm" => Self::Webm,
-            "video/mpeg" => Self::Mpeg,
-            _ => Self::Invalid
-        }
-    }
-}
-
-impl<'a> Into<&'a str> for MediaType {
-    fn into(self) -> &'a str {
-        match self {
-            Self::Mp4 => "mp4",
-            Self::Mov => "mov",
-            Self::Webm => "webm",
-            Self::Mpeg => "mpeg",
-            Self::Invalid => "Invalid media type"
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum Errors {
-    Reqwest(ReqwestError),
-    DotEnv(DotEnvError),
-    Deserialize(SerdeError),
-    Regex(RegexError),
-    EnvVar(VarError),
-    Io(IoError),
-    NativeTls(NativeTlsError),
-    Handshake(HandshakeError<TcpStream>),
-    ToStr(ToStrError),
-    ParseInt(ParseIntError),
-}
-
-impl From<ReqwestError> for Errors {
-    fn from(error: ReqwestError) -> Self {
-        Self::Reqwest(error)
-    }
-}
-
-impl From<DotEnvError> for Errors {
-    fn from(error: DotEnvError) -> Self {
-        Self::DotEnv(error)
-    }
-}
-
-impl From<VarError> for Errors {
-    fn from(error: VarError) -> Self {
-        Self::EnvVar(error)
-    }
-}
-
-impl From<RegexError> for Errors {
-    fn from(error: RegexError) -> Self {
-        Self::Regex(error)
-    }
-}
-
-impl From<SerdeError> for Errors {
-    fn from(error: SerdeError) -> Self {
-        Self::Deserialize(error)
-    }
-}
-
-impl From<IoError> for Errors {
-    fn from(error: IoError) -> Self {
-        Self::Io(error)
-    }
-}
-
-impl From<NativeTlsError> for Errors {
-    fn from(value: NativeTlsError) -> Self {
-        Self::NativeTls(value)
-    }
-}
-
-impl From<HandshakeError<TcpStream>> for Errors {
-    fn from(value: HandshakeError<TcpStream>) -> Self {
-        Self::Handshake(value)
-    }
-}
-
-impl From<ToStrError> for Errors {
-    fn from(value: ToStrError) -> Self {
-        Self::ToStr(value)
-    }
-}
-
-impl From<ParseIntError> for Errors {
-    fn from(value: ParseIntError) -> Self {
-        Self::ParseInt(value)
-    }
-}
-
-impl Display for Errors {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Reqwest(error) => write!(f, "Unable to send request => {error}"),
-            Self::DotEnv(error) => write!(f, "Unable to load environment file => {error}"),
-            Self::Deserialize(error) => write!(f, "Could not deserialize bytes => {error}"),
-            Self::Regex(error) => write!(f, "Unable to build regular expression => {error}"),
-            Self::EnvVar(error) => write!(f, "Could not load environment variable => {error}"),
-            Self::Io(error) => write!(f, "Unable to create file due to error => {error}"),
-            Self::NativeTls(error) => write!(f, "TLS error => {error}"),
-            Self::Handshake(error) => write!(f, "Unable to successfully complete TCP handshake => {error}"),
-            Self::ToStr(error) => write!(f, "Unable to convert to str => {error}"),
-            Self::ParseInt(error) => write!(f, "Could not parse integer => {error}"),
-        }
-    }
-}
+use crate::lib::{errors::Errors, extension::{reqwest_client::{ClientBuilder, RequestType}, save_media}, post::Post, types::{BskyCreds, Did, MediaType, ThreadData}};
 
 pub async fn archive(post_info: Post) -> Result<(), Errors> {
     let captures = &post_info.post_id_regex.captures(&post_info.info.url);
-
-    // Exit code 100 means no post data could be extracted.
-    let post_info_pieces = match captures {
-        Some(captures) => captures,
-        None => exit(100),
-    };
-    let mut headers = HeaderMap::new();
-
-    headers.insert("User-Agent", HeaderValue::from_static("Mozilla/5.0"));
-    headers.insert("Content-Type", HeaderValue::from_static("application/json"));
-
-    let client = ClientBuilder::new()
+    let post_info_pieces = captures.as_ref().expect("Invalid post URL");
+    let handle = &post_info_pieces[1];
+    let post_id = &post_info_pieces[2];
+    let client = ReqwestClientBuilder::new()
         .redirect(Policy::limited(100))
-        .default_headers(headers)
         .build()?;
+    let auth_payload = json!({
+        "identifier": &post_info.info.username,
+        "password": &post_info.info.password
+    }).to_string();
+    let mut client = ClientBuilder::new(Some(client), RequestType::Post, "https://bsky.social/xrpc/com.atproto.server.createSession".into(), None, Some(auth_payload.as_bytes().into()), None, None);
     let url = format!("https://web.archive.org/save/{}", &post_info.info.url);
 
     // Here we will login to Bluesky, get a JWT token, then get the post
-    let auth_response = client
-        .post("https://bsky.social/xrpc/com.atproto.server.createSession")
-        .body(
-            json!({
-                "identifier": &post_info.info.username,
-                "password": &post_info.info.password
-            })
-            .to_string(),
-        )
-        .send()
-        .await?
-        .bytes()
-        .await?
-        .to_vec();
+    let auth_response = client.send_request().await?;
     let creds = serde_json::from_slice::<BskyCreds>(&auth_response)?;
     let response = &client
-        .get(format!(
-            "https://bsky.social/xrpc/com.atproto.identity.resolveHandle?handle={}",
-            &post_info_pieces[1],
-        ))
-        .send()
-        .await?
-        .bytes()
-        .await?
-        .to_vec();
-    let did = serde_json::from_slice::<Did>(&response)?;
-    let response = client
-        .get(format!(
-            "https://bsky.social/xrpc/app.bsky.feed.getPostThread?uri=at://{}/app.bsky.feed.post/{}",
-            did.did, &post_info_pieces[2]
-        ))
-        .bearer_auth(&creds.access_jwt)
-        .send()
-        .await?
-        .bytes()
-        .await?.to_vec();
+        .set_request_type(RequestType::Get)
+        .set_url(format!("https://bsky.social/xrpc/com.atproto.identity.resolveHandle?handle={handle}"))
+        .send_request()
+        .await?;
+    let did = serde_json::from_slice::<Did>(&response)?.did;
+    let response = &client
+        .set_url(format!("https://bsky.social/xrpc/app.bsky.feed.getPostThread?uri=at://{did}/app.bsky.feed.post/{post_id}"))
+        .set_bearer_auth(Some(creds.access_jwt))
+        .send_request()
+        .await?;
     let post_data = serde_json::from_slice::<ThreadData>(&response)?;
 
     if let Some(post) = post_data.thread.post {
@@ -203,11 +48,11 @@ pub async fn archive(post_info: Post) -> Result<(), Errors> {
 
             // Write the post content to a file to preserve its contents locally
             if !&post_info.posts_dir_exists {
-                std::fs::create_dir("./posts")?;
+                create_dir("./posts")?;
             }
-            std::fs::create_dir(format!("./posts/{}", &post_info_pieces[2]))?;
+            create_dir(format!("./posts/{post_id}"))?;
 
-            let filename = &format!("./posts/{}/raw.json", &post_info_pieces[2]);
+            let filename = &format!("./posts/{post_id}/raw.json");
             let mut file = File::create_new(filename).await?;
 
             file.write_all(&response).await?;
@@ -215,58 +60,28 @@ pub async fn archive(post_info: Post) -> Result<(), Errors> {
 
             if let Some(media) = record.embed {
                 for image in media.images {
-                    let referer = &image.image.referer;
-                    let url = format!(
-                        "https://bsky.social/xrpc/com.atproto.sync.getBlob?did={}&cid={}",
-                        &did.did, &referer.cid
-                    );
-                    let response = client.get(&url).send().await?.bytes().await?.to_vec();
-                    let mut image_file = File::create(format!(
-                        "./posts/{}/{}.png",
-                        &post_info_pieces[2], &referer.cid
-                    ))
-                    .await?;
-                    image_file.write(&response).await?;
-                    println!("Saved {}", &referer.cid)
+                    let cid = image.image.referer.resource_cid;
+                    let _ = save_media(None, &did, &cid, &mut client, post_id.into()).await?;
+
+                    println!("Saved {cid}");
                 }
                 if let Some(video) = media.video {
-                    println!("Saving video from post");
-
-                    // Exit code 101 is for no media type being provided in the response
                     let media_type = video.mime_type.as_str();
-                    println!("MEDIA TYPE => {media_type}");
                     let media_type: MediaType = MediaType::from(media_type);
                     let media_type: &'static str = media_type.into();
-                    let referer = video.referer;
-                    let url_path = format!(
-                        "/xrpc/com.atproto.sync.getBlob?did={}&cid={}",
-                        &did.did, &referer.cid
-                    );
+                    let cid = video.referer.resource_cid;
+                    let _ = save_media(Some(media_type), &did, &cid, &mut client, post_id.into()).await?;
 
-                    // Get the response headers for the redirect location to get the blob data
-                    let reqwest_response = client
-                        .get(format!("https://bsky.social{url_path}"))
-                        .bearer_auth(&creds.access_jwt)
-                        .send()
-                        .await?;
-                    let reqwest_response = reqwest_response
-                        .bytes()
-                        .await?;
-                    let reqwest_response = reqwest_response
-                        .as_bytes();
-                    let mut video_file = File::create(format!(
-                            "./posts/{}/{}.{}",
-                        &post_info_pieces[2], &referer.cid, media_type
-	                )).await?;
-
-                    video_file.write_all(reqwest_response).await?;
+                    println!("Saved video")
                 }
             }
         }
     }
-    println!("Archiving externally...");
-    client.get(url).send().await?;
-    println!("Post archived successfully.");
+
+    let _ = client
+        .set_url(url)
+        .send_request()
+        .await?;
 
     Ok(())
 }

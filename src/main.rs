@@ -6,7 +6,7 @@ use egui::{Context, IconData, Vec2, ViewportBuilder};
 // Re exports
 pub use lib::post_information::PostInformation;
 
-use crate::lib::Errors;
+use crate::lib::errors::Errors;
 
 #[tokio::main]
 async fn main() -> Result<(), Errors> {

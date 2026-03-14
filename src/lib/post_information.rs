@@ -1,4 +1,4 @@
-use crate::lib::{Errors, archive, post::Post};
+use crate::lib::{errors::Errors, archive, post::Post};
 use eframe::App;
 use egui::{CentralPanel, Color32, Label, Margin, TextEdit, Ui};
 use regex::Regex;
